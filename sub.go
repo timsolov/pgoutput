@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,7 +23,7 @@ type Subscription struct {
 	Publication   string
 	WaitTimeout   time.Duration
 	StatusTimeout time.Duration
-	tables        []string
+	//tables        []string
 
 	conn       *pgconn.PgConn
 	maxWal     uint64
@@ -40,17 +38,17 @@ type Subscription struct {
 
 type Handler func(Message, uint64) error
 
-func NewSubscription(conn *pgconn.PgConn, name, publication string, tables []string, walRetain uint64, failOnHandler bool) *Subscription {
-	if tables == nil {
-		tables = make([]string, 0)
-	}
+func NewSubscription(conn *pgconn.PgConn, name, publication string, walRetain uint64, failOnHandler bool) *Subscription {
+	//if tables == nil {
+	//	tables = make([]string, 0)
+	//}
 
 	return &Subscription{
 		Name:          name,
 		Publication:   publication,
 		WaitTimeout:   1 * time.Second,
 		StatusTimeout: 10 * time.Second,
-		tables:        tables,
+		//tables:        tables,
 
 		conn:          conn,
 		walRetain:     walRetain,
@@ -67,36 +65,51 @@ func (s *Subscription) CreateSlot() (err error) {
 	// If creating the replication slot fails with code 42710, this means
 	// the replication slot already exists.
 	ctx := context.Background()
-	sql := fmt.Sprintf("DROP PUBLICATION IF EXISTS %s;", s.Publication)
-	result := s.conn.Exec(context.Background(), sql)
-	_, err = result.ReadAll()
-	if err != nil {
-		return fmt.Errorf("drop publication if exists error", err)
-	}
+	//sql := fmt.Sprintf("DROP PUBLICATION IF EXISTS %s;", s.Publication)
+	//result := s.conn.Exec(context.Background(), sql)
+	//_, err = result.ReadAll()
+	//if err != nil {
+	//	return fmt.Errorf("drop publication if exists error", err)
+	//}
+	//
+	//var sql string
+	//if len(s.tables) == 0 {
+	//	sql = fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES;", s.Publication)
+	//} else {
+	//	sql = fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s;", s.Publication, strings.Join(s.tables, ","))
+	//}
+	//
+	//result := s.conn.Exec(context.Background(), sql)
+	//_, err = result.ReadAll()
+	//if err != nil {
+	//	if e, ok := err.(*pgconn.PgError); ok && e.Code == "42710" {
+	//		// publication exists
+	//	} else {
+	//		return err
+	//	}
+	//}
 
-	if len(s.tables) == 0 {
-		sql = fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES;", s.Publication)
-	} else {
-		sql = fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s;", s.Publication, strings.Join(s.tables, ","))
-	}
-
-	result = s.conn.Exec(context.Background(), sql)
-	_, err = result.ReadAll()
-	if err != nil {
-		return fmt.Errorf("create publication error", err)
-	}
-
-	sysident, err := pglogrepl.IdentifySystem(context.Background(), s.conn)
-	if err != nil {
-		return fmt.Errorf("IdentifySystem failed:", err)
-	}
-	log.Println("SystemID:", sysident.SystemID, "Timeline:", sysident.Timeline, "XLogPos:", sysident.XLogPos, "DBName:", sysident.DBName)
+	//sysident, err := pglogrepl.IdentifySystem(context.Background(), s.conn)
+	//if err != nil {
+	//	return fmt.Errorf("IdentifySystem failed:", err)
+	//}
+	//log.Println("SystemID:", sysident.SystemID, "Timeline:", sysident.Timeline, "XLogPos:", sysident.XLogPos, "DBName:", sysident.DBName)
 
 	_, err = pglogrepl.CreateReplicationSlot(ctx, s.conn, s.Name, "pgoutput", pglogrepl.CreateReplicationSlotOptions{Temporary: false})
 	if err != nil {
 		if e, ok := err.(*pgconn.PgError); ok && e.Code == "42710" {
 			return ErrorSlotExist
 		}
+		return err
+	}
+
+	return nil
+}
+
+func (s *Subscription) DropSlot() (err error) {
+	ctx := context.Background()
+	err = pglogrepl.DropReplicationSlot(ctx, s.conn, s.Name, pglogrepl.DropReplicationSlotOptions{Wait: false})
+	if err != nil {
 		return err
 	}
 
@@ -210,17 +223,6 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 				}
 				return fmt.Errorf("ReceiveMessage failed: %s", err)
 			}
-
-			//if err == context.DeadlineExceeded {
-			//	continue
-			//} else if err == context.Canceled {
-			//	return err
-			//} else if err != nil {
-			//	if pgconn.Timeout(err) {
-			//		continue
-			//	}
-			//	return fmt.Errorf("replication failed: %s", err)
-			//}
 
 			if msg == nil {
 				return fmt.Errorf("replication failed: nil message received, should not happen")

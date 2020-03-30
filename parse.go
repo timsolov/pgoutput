@@ -168,6 +168,9 @@ type Delete struct {
 	Row []Tuple
 }
 
+type Truncate struct {
+}
+
 type Origin struct {
 	LSN  uint64
 	Name string
@@ -201,6 +204,7 @@ func (Delete) msg()   {}
 func (Commit) msg()   {}
 func (Origin) msg()   {}
 func (Type) msg()     {}
+func (Truncate) msg() {}
 
 // Parse a logical replication message.
 // See https://www.postgresql.org/docs/current/static/protocol-logicalrep-message-formats.html
@@ -264,6 +268,9 @@ func Parse(src []byte) (Message, error) {
 		dl.Old = d.rowinfo('O')
 		dl.Row = d.tupledata()
 		return dl, nil
+	case 'T':
+		tr := Truncate{}
+		return tr, nil
 	default:
 		return nil, fmt.Errorf("Unknown message type for %s (%d)", []byte{msgType}, msgType)
 	}

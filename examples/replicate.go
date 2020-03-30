@@ -56,7 +56,11 @@ func main() {
 		return nil
 	}
 
-	sub := pgoutput.NewSubscription(conn, "subtest", "pubtest", nil, 0, false)
+	sub := pgoutput.NewSubscription(conn, "subtest", "pubtest", 0, false)
+	//err = sub.DropSlot()
+	//if err != nil {
+	//	log.Println(err)
+	//}
 	err = sub.CreateSlot()
 	if err != nil {
 		if err == pgoutput.ErrorSlotExist {
