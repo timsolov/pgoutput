@@ -3,13 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"git.celefish.com/gopkgs/pgoutput"
+	"github.com/jackc/pgconn"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-
-	"git.celefish.com/gopkgs/pgoutput"
-	"github.com/jackc/pgconn"
 )
 
 func main() {
@@ -57,10 +56,6 @@ func main() {
 	}
 
 	sub := pgoutput.NewSubscription(conn, "subtest", "pubtest", 0, false)
-	//err = sub.DropSlot()
-	//if err != nil {
-	//	log.Println(err)
-	//}
 	err = sub.CreateSlot()
 	if err != nil {
 		if err == pgoutput.ErrorSlotExist {

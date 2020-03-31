@@ -257,9 +257,9 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 						continue
 					}
 
-					if walStart > atomic.LoadUint64(&s.maxWal) {
-						atomic.StoreUint64(&s.maxWal, walStart)
-					}
+					//if walStart > atomic.LoadUint64(&s.maxWal) {
+					//	atomic.StoreUint64(&s.maxWal, walStart)
+					//}
 
 					var logmsg Message
 					logmsg, err = Parse(xld.WALData)
@@ -272,6 +272,9 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 						return err
 					}
 
+					if walStart > atomic.LoadUint64(&s.maxWal) {
+						atomic.StoreUint64(&s.maxWal, walStart)
+					}
 				}
 			default:
 				//log.Printf("Received unexpected message: %#v\n", msg)
