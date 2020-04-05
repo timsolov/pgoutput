@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -37,25 +38,35 @@ func main() {
 		return nil
 	}
 
-	handler := func(m pgoutput.Message, walPos uint64) error {
-		switch v := m.(type) {
-		case pgoutput.Relation:
-			log.Printf("RELATION")
-			set.Add(v)
-		case pgoutput.Insert:
-			log.Printf("INSERT")
-			return dump(v.RelationID, v.Row)
-		case pgoutput.Update:
-			log.Printf("UPDATE")
-			return dump(v.RelationID, v.Row)
-		case pgoutput.Delete:
-			log.Printf("DELETE")
-			return dump(v.RelationID, v.Row)
+	nMsg := 0
+	handler := func(messages []pgoutput.Message, walPos uint64) error {
+		for _, m := range messages {
+			switch v := m.(type) {
+			case pgoutput.Relation:
+				log.Printf("RELATION")
+				set.Add(v)
+			case pgoutput.Insert:
+				log.Printf("INSERT")
+				dump(v.RelationID, v.Row)
+			case pgoutput.Update:
+				log.Printf("UPDATE")
+				dump(v.RelationID, v.Row)
+			case pgoutput.Delete:
+				log.Printf("DELETE")
+				dump(v.RelationID, v.Row)
+			case pgoutput.Begin:
+				log.Printf("BEGIN")
+			case pgoutput.Commit:
+				log.Printf("COMMIT")
+			}
+			nMsg++
+			//log.Println(nMsg)
 		}
+
 		return nil
 	}
 
-	sub := pgoutput.NewSubscription(conn, "subtest", "pubtest", 0, false)
+	sub := pgoutput.NewSubscription(conn, "dmevtsub", "dmevtpub", 0, false)
 	err = sub.CreateSlot()
 	if err != nil {
 		if err == pgoutput.ErrorSlotExist {
@@ -80,7 +91,7 @@ func main() {
 	}()
 
 	signal.Notify(osSignal, syscall.SIGINT, syscall.SIGTERM)
-	if err = sub.Start(ctx, 0, handler); err != nil {
+	if err = sub.Start(ctx, 0, 100, time.Millisecond*100, handler); err != nil {
 		log.Fatal(err)
 	}
 }

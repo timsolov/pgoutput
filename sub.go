@@ -21,9 +21,7 @@ var (
 type Subscription struct {
 	Name          string
 	Publication   string
-	WaitTimeout   time.Duration
 	StatusTimeout time.Duration
-	//tables        []string
 
 	conn       *pgconn.PgConn
 	maxWal     uint64
@@ -36,17 +34,12 @@ type Subscription struct {
 	sync.Mutex
 }
 
-type Handler func(Message, uint64) error
+type Handler func([]Message, uint64) error
 
 func NewSubscription(conn *pgconn.PgConn, name, publication string, walRetain uint64, failOnHandler bool) *Subscription {
-	//if tables == nil {
-	//	tables = make([]string, 0)
-	//}
-
 	return &Subscription{
 		Name:          name,
 		Publication:   publication,
-		WaitTimeout:   1 * time.Second,
 		StatusTimeout: 10 * time.Second,
 		//tables:        tables,
 
@@ -152,7 +145,8 @@ func (s *Subscription) Flush() error {
 }
 
 // Start replication and block until error or ctx is canceled
-func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (err error) {
+func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int, recvWindow time.Duration, h Handler) error {
+	var err error
 	err = pglogrepl.StartReplication(context.Background(), s.conn, s.Name, pglogrepl.LSN(startLSN),
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{pluginArgs("1", s.Publication)},
@@ -183,7 +177,10 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 		return s.sendStatus(walPos, walFlush)
 	}
 
+	heartbeat := make(chan bool)
+	defer close(heartbeat)
 	go func() {
+		var err error
 		tick := time.NewTicker(s.StatusTimeout)
 		defer tick.Stop()
 
@@ -191,9 +188,12 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 			select {
 			case <-tick.C:
 				if err = sendStatus(); err != nil {
-					return
+					continue
 				}
-
+			case <-heartbeat:
+				if err = sendStatus(); err != nil {
+					continue
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -208,50 +208,68 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 				return fmt.Errorf("Unable to send final status: %s", err)
 			}
 
-			return
+			return err
 
 		default:
-			wctx, cancel := context.WithTimeout(ctx, s.WaitTimeout)
-			s.Lock()
-			msg, err := s.conn.ReceiveMessage(wctx)
-			s.Unlock()
-			cancel()
+			n := 0
+			messages := make([][]byte, 0)
+			// batch recv messages up to batchSize
+			for n < batchSize {
+				wctx, cancel := context.WithTimeout(ctx, recvWindow)
+				s.Lock()
+				msg, err := s.conn.ReceiveMessage(wctx)
+				s.Unlock()
+				cancel()
 
-			if err != nil {
-				if pgconn.Timeout(err) {
-					continue
+				if err != nil {
+					if pgconn.Timeout(err) { // timeout, break loop
+						break
+					}
+					return fmt.Errorf("ReceiveMessage failed: %s", err)
 				}
-				return fmt.Errorf("ReceiveMessage failed: %s", err)
+
+				if msg == nil {
+					return fmt.Errorf("replication failed: nil message received, should not happen")
+				}
+
+				//log.Printf("%v, %#v", &msg, msg)
+				if msg, ok := msg.(*pgproto3.CopyData); ok {
+					messages = append(messages, msg.Data)
+				}
 			}
 
-			if msg == nil {
-				return fmt.Errorf("replication failed: nil message received, should not happen")
+			//log.Printf("%#v", messages)
+			// no message received, continue receiving
+			if len(messages) == 0 {
+				continue
 			}
 
-			switch msg := msg.(type) {
-			case *pgproto3.CopyData:
-				switch msg.Data[0] {
+			logmsgs := make([]Message, 0)
+			var walStart uint64
+			for _, msg := range messages {
+				switch msg[0] {
 				case pglogrepl.PrimaryKeepaliveMessageByteID:
-					pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
+					pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg[1:])
 					if err != nil {
 						return fmt.Errorf("ParsePrimaryKeepaliveMessage failed:", err)
 					}
 					//log.Println("Primary Keepalive Message =>", "ServerWALEnd:", pkm.ServerWALEnd, "ServerTime:", pkm.ServerTime, "ReplyRequested:", pkm.ReplyRequested)
 
 					if pkm.ReplyRequested {
-						if err = sendStatus(); err != nil {
-							return err
-						}
+						//if err = sendStatus(); err != nil {
+						//	return err
+						//}
+						heartbeat <- true
 					}
 
 				case pglogrepl.XLogDataByteID:
-					xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
+					xld, err := pglogrepl.ParseXLogData(msg[1:])
 					if err != nil {
 						return fmt.Errorf("ParseXLogData failed:", err)
 					}
 					//log.Println("XLogData =>", "WALStart", xld.WALStart, "ServerWALEnd", xld.ServerWALEnd, "ServerTime:", xld.ServerTime, "WALData", string(xld.WALData))
 
-					walStart := uint64(xld.WALStart)
+					walStart = uint64(xld.WALStart)
 					// Skip stuff that's in the past
 					if walStart > 0 && walStart <= startLSN {
 						continue
@@ -261,23 +279,23 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 					//	atomic.StoreUint64(&s.maxWal, walStart)
 					//}
 
-					var logmsg Message
-					logmsg, err = Parse(xld.WALData)
+					logmsg, err := Parse(xld.WALData)
 					if err != nil {
 						return fmt.Errorf("invalid pgoutput message: %s", err)
 					}
-
-					// Ignore the error from handler for now
-					if err = h(logmsg, walStart); err != nil && s.failOnHandler {
-						return err
-					}
-
-					if walStart > atomic.LoadUint64(&s.maxWal) {
-						atomic.StoreUint64(&s.maxWal, walStart)
-					}
+					logmsgs = append(logmsgs, logmsg)
 				}
-			default:
-				//log.Printf("Received unexpected message: %#v\n", msg)
+			}
+
+			// Ignore the error from handler for now
+			if len(logmsgs) > 0 {
+				if err = h(logmsgs, walStart); err != nil && s.failOnHandler {
+					return err
+				}
+
+				if walStart > atomic.LoadUint64(&s.maxWal) {
+					atomic.StoreUint64(&s.maxWal, walStart)
+				}
 			}
 		}
 	}
