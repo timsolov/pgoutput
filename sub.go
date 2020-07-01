@@ -41,7 +41,6 @@ func NewSubscription(conn *pgconn.PgConn, name, publication string, walRetain ui
 		Name:          name,
 		Publication:   publication,
 		StatusTimeout: 10 * time.Second,
-		//tables:        tables,
 
 		conn:          conn,
 		walRetain:     walRetain,
@@ -127,7 +126,7 @@ func (s *Subscription) sendStatus(walWrite, walFlush uint64) error {
 	if err != nil {
 		return err
 	}
-	//log.Printf("Send status => walWrite: %d, walFlush: %d\n", walWrite, walFlush)
+	//fmt.Printf("Send status => walWrite: %d, walFlush: %d\n", walWrite, walFlush)
 
 	return nil
 }
@@ -245,7 +244,7 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 			}
 
 			logmsgs := make([]Message, 0)
-			var walStart uint64
+			var walStart, serverWalEnd uint64
 			for _, msg := range messages {
 				switch msg[0] {
 				case pglogrepl.PrimaryKeepaliveMessageByteID:
@@ -253,7 +252,9 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 					if err != nil {
 						return fmt.Errorf("ParsePrimaryKeepaliveMessage failed:", err)
 					}
-					//log.Println("Primary Keepalive Message =>", "ServerWALEnd:", pkm.ServerWALEnd, "ServerTime:", pkm.ServerTime, "ReplyRequested:", pkm.ReplyRequested)
+					//fmt.Println("Primary Keepalive Message =>", "ServerWALEnd:", pkm.ServerWALEnd, "ServerTime:", pkm.ServerTime, "ReplyRequested:", pkm.ReplyRequested)
+
+					serverWalEnd = uint64(pkm.ServerWALEnd)
 
 					if pkm.ReplyRequested {
 						//if err = sendStatus(); err != nil {
@@ -296,6 +297,15 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 				if walStart > atomic.LoadUint64(&s.maxWal) {
 					atomic.StoreUint64(&s.maxWal, walStart)
 				}
+			}
+
+			if serverWalEnd > walStart {
+				atomic.StoreUint64(&s.maxWal, serverWalEnd)
+			}
+
+			err = s.Flush() // notify server than all WAL messages are processed
+			if err != nil {
+				return err
 			}
 		}
 	}

@@ -66,7 +66,7 @@ func main() {
 		return nil
 	}
 
-	sub := pgoutput.NewSubscription(conn, "dmevtsub", "dmevtpub", 0, false)
+	sub := pgoutput.NewSubscription(conn, "usrevtsub", "usrevtpub", 0, false)
 	err = sub.CreateSlot()
 	if err != nil {
 		if err == pgoutput.ErrorSlotExist {
