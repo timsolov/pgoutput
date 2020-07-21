@@ -126,7 +126,6 @@ func (s *Subscription) sendStatus(walWrite, walFlush uint64) error {
 	if err != nil {
 		return err
 	}
-	//fmt.Printf("Send status => walWrite: %d, walFlush: %d\n", walWrite, walFlush)
 
 	return nil
 }
@@ -140,6 +139,7 @@ func (s *Subscription) Flush() error {
 		atomic.StoreUint64(&s.walFlushed, wp)
 	}
 
+	//fmt.Printf("Flush => walWrite: %d, walFlush: %d\n", wp, wp)
 	return err
 }
 
@@ -172,6 +172,8 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 			// If we have less than walRetain bytes - just report zero
 			walFlush = 0
 		}
+
+		//fmt.Printf("Send status => walWrite: %d, walFlush: %d\n", walPos, walFlush)
 
 		return s.sendStatus(walPos, walFlush)
 	}
@@ -213,6 +215,7 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 			n := 0
 			messages := make([][]byte, 0)
 			// batch recv messages up to batchSize
+			//start :=  time.Now()
 			for n < batchSize {
 				wctx, cancel := context.WithTimeout(ctx, recvWindow)
 				s.Lock()
@@ -235,7 +238,11 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 				if msg, ok := msg.(*pgproto3.CopyData); ok {
 					messages = append(messages, msg.Data)
 				}
+
+				n++
 			}
+
+			//fmt.Printf("recv %d messages in %d ms.\n", len(messages), time.Since(start).Milliseconds())
 
 			//log.Printf("%#v", messages)
 			// no message received, continue receiving
@@ -268,14 +275,18 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 					if err != nil {
 						return fmt.Errorf("ParseXLogData failed:", err)
 					}
-					//log.Println("XLogData =>", "WALStart", xld.WALStart, "ServerWALEnd", xld.ServerWALEnd, "ServerTime:", xld.ServerTime, "WALData", string(xld.WALData))
+					//fmt.Println("XLogData =>", "WALStart", xld.WALStart, "ServerWALEnd", xld.ServerWALEnd, "ServerTime:", xld.ServerTime, "WALData", string(xld.WALData))
 
-					walStart = uint64(xld.WALStart)
+					if walStart == 0 {
+						walStart = uint64(xld.WALStart)
+					}
+
 					// Skip stuff that's in the past
 					if walStart > 0 && walStart <= startLSN {
 						continue
 					}
 
+					serverWalEnd = uint64(xld.ServerWALEnd)
 					//if walStart > atomic.LoadUint64(&s.maxWal) {
 					//	atomic.StoreUint64(&s.maxWal, walStart)
 					//}
@@ -294,18 +305,17 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 					return err
 				}
 
-				if walStart > atomic.LoadUint64(&s.maxWal) {
-					atomic.StoreUint64(&s.maxWal, walStart)
-				}
+				//if walStart > atomic.LoadUint64(&s.maxWal) {
+				//	atomic.StoreUint64(&s.maxWal, walStart)
+				//}
 			}
 
-			if serverWalEnd > walStart {
+			if serverWalEnd > atomic.LoadUint64(&s.maxWal) {
 				atomic.StoreUint64(&s.maxWal, serverWalEnd)
-			}
-
-			err = s.Flush() // notify server than all WAL messages are processed
-			if err != nil {
-				return err
+				err = s.Flush() // notify server than all WAL messages are processed
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
