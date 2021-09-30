@@ -3,13 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
-	"git.celefish.com/gopkgs/pgoutput"
-	"github.com/jackc/pgconn"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/jackc/pgconn"
+	"github.com/timsolov/pgoutput"
 )
 
 func main() {

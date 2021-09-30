@@ -1,4 +1,4 @@
-module git.celefish.com/gopkgs/pgoutput
+module github.com/timsolov/pgoutput
 
 require (
 	github.com/google/go-cmp v0.2.0
