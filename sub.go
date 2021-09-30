@@ -127,6 +127,8 @@ func (s *Subscription) sendStatus(walWrite, walFlush uint64) error {
 		return err
 	}
 
+	atomic.StoreUint64(&s.walFlushed, walFlush)
+
 	return nil
 }
 
@@ -136,7 +138,7 @@ func (s *Subscription) Flush() error {
 	wp := atomic.LoadUint64(&s.maxWal)
 	err := s.sendStatus(wp, wp)
 	if err == nil {
-		atomic.StoreUint64(&s.walFlushed, wp)
+		// atomic.StoreUint64(&s.walFlushed, wp)
 	}
 
 	//fmt.Printf("Flush => walWrite: %d, walFlush: %d\n", wp, wp)
@@ -173,7 +175,7 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 			walFlush = 0
 		}
 
-		//fmt.Printf("Send status => walWrite: %d, walFlush: %d\n", walPos, walFlush)
+		fmt.Printf("Send status => walWrite: %d (%s), walFlush: %d (%s)\n", walPos, pglogrepl.LSN(walPos), walFlush, pglogrepl.LSN(walFlush))
 
 		return s.sendStatus(walPos, walFlush)
 	}
@@ -257,7 +259,7 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 				case pglogrepl.PrimaryKeepaliveMessageByteID:
 					pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg[1:])
 					if err != nil {
-						return fmt.Errorf("ParsePrimaryKeepaliveMessage failed:", err)
+						return fmt.Errorf("ParsePrimaryKeepaliveMessage failed: %s", err)
 					}
 					//fmt.Println("Primary Keepalive Message =>", "ServerWALEnd:", pkm.ServerWALEnd, "ServerTime:", pkm.ServerTime, "ReplyRequested:", pkm.ReplyRequested)
 
@@ -273,7 +275,7 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 				case pglogrepl.XLogDataByteID:
 					xld, err := pglogrepl.ParseXLogData(msg[1:])
 					if err != nil {
-						return fmt.Errorf("ParseXLogData failed:", err)
+						return fmt.Errorf("ParseXLogData failed: %s", err)
 					}
 					//fmt.Println("XLogData =>", "WALStart", xld.WALStart, "ServerWALEnd", xld.ServerWALEnd, "ServerTime:", xld.ServerTime, "WALData", string(xld.WALData))
 
@@ -312,10 +314,11 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 
 			if serverWalEnd > atomic.LoadUint64(&s.maxWal) {
 				atomic.StoreUint64(&s.maxWal, serverWalEnd)
-				err = s.Flush() // notify server than all WAL messages are processed
-				if err != nil {
-					return err
-				}
+				// heartbeat <- true
+				// err = s.Flush() // notify server than all WAL messages are processed
+				// if err != nil {
+				// 	return err
+				// }
 			}
 		}
 	}
