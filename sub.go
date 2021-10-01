@@ -175,7 +175,7 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 			walFlush = 0
 		}
 
-		fmt.Printf("Send status => walWrite: %d (%s), walFlush: %d (%s)\n", walPos, pglogrepl.LSN(walPos), walFlush, pglogrepl.LSN(walFlush))
+		// fmt.Printf("Send status => walWrite: %d (%s), walFlush: %d (%s)\n", walPos, pglogrepl.LSN(walPos), walFlush, pglogrepl.LSN(walFlush))
 
 		return s.sendStatus(walPos, walFlush)
 	}
