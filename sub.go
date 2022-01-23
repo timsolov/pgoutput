@@ -148,7 +148,7 @@ func (s *Subscription) Flush() error {
 // Start replication and block until error or ctx is canceled
 func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int, recvWindow time.Duration, h Handler) error {
 	var err error
-	err = pglogrepl.StartReplication(context.Background(), s.conn, s.Name, pglogrepl.LSN(startLSN),
+	err = pglogrepl.StartReplication(ctx, s.conn, s.Name, pglogrepl.LSN(startLSN),
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{pluginArgs("1", s.Publication)},
 		})
@@ -183,20 +183,18 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 	heartbeat := make(chan bool)
 	defer close(heartbeat)
 	go func() {
-		var err error
 		tick := time.NewTicker(s.StatusTimeout)
 		defer tick.Stop()
 
 		for {
 			select {
 			case <-tick.C:
-				if err = sendStatus(); err != nil {
-					continue
+				sendStatus()
+			case _, ok := <-heartbeat:
+				if !ok {
+					return
 				}
-			case <-heartbeat:
-				if err = sendStatus(); err != nil {
-					continue
-				}
+				sendStatus()
 			case <-ctx.Done():
 				return
 			}
