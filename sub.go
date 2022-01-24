@@ -19,16 +19,17 @@ var (
 )
 
 type Subscription struct {
-	Name          string
-	Publication   string
-	StatusTimeout time.Duration
+	SlotName        string // name of replication slot
+	PublicationName string
+	StatusTimeout   time.Duration
 
 	conn       *pgconn.PgConn
-	maxWal     uint64
+	maxWal     uint64 // WAL pos readed from DB
 	walRetain  uint64
-	walFlushed uint64
+	walFlushed uint64 // WAL pos acknowledged as processed
+	logger     Logger
 
-	failOnHandler bool
+	failOnHandler bool // whether to exit from Start() func on failure in user's handler
 
 	// Mutex is used to prevent reading and writing to a connection at the same time
 	sync.Mutex
@@ -36,60 +37,78 @@ type Subscription struct {
 
 type Handler func([]Message, uint64) error
 
-func NewSubscription(conn *pgconn.PgConn, name, publication string, walRetain uint64, failOnHandler bool) *Subscription {
-	return &Subscription{
-		Name:          name,
-		Publication:   publication,
-		StatusTimeout: 10 * time.Second,
+type SubOpt func(*Subscription)
 
-		conn:          conn,
-		walRetain:     walRetain,
-		failOnHandler: failOnHandler,
+// set some logger
+func SetLogger(l Logger) SubOpt {
+	return func(s *Subscription) {
+		s.logger = l
 	}
 }
 
-func pluginArgs(version, publication string) string {
-	return fmt.Sprintf(`"proto_version" '%s', "publication_names" '%s'`, version, publication)
+// number bytes in past do not apply as processed in WAL
+func SetWALRetain(retainBytes uint64) SubOpt {
+	return func(s *Subscription) {
+		s.walRetain = retainBytes
+	}
 }
 
-// CreateSlot creates a replication slot if it doesn't exist
+// Whether to exit from Start() func on failure in users handler
+func SetFailOnHandler(b bool) SubOpt {
+	return func(s *Subscription) {
+		s.failOnHandler = b
+	}
+}
+
+// NewSubscription creates and fill out Subscription struct.
+// To start listening logical replication you've to run Start method.
+//   name - replication slot name
+//   publication - publication name
+func NewSubscription(conn *pgconn.PgConn, slotName, publicationName string, opts ...SubOpt) *Subscription {
+	sub := &Subscription{
+		SlotName:        slotName,
+		PublicationName: publicationName,
+		StatusTimeout:   10 * time.Second,
+
+		conn: conn,
+	}
+
+	for _, opt := range opts {
+		opt(sub)
+	}
+
+	return sub
+}
+
+func pluginArgs(version, publicationName string) []string {
+	return []string{
+		fmt.Sprintf("proto_version '%s'", version),
+		fmt.Sprintf("publication_names '%s'", publicationName),
+	}
+}
+
+// CreateSlot creates a replication slot if it doesn't exist.
+// The slot should be created before Start func.
+//   returns:
+//     nil - slot created;
+//     ErrorSlotExist - not an error but means slot already exists;
+//     other error - means an error.
 func (s *Subscription) CreateSlot() (err error) {
 	// If creating the replication slot fails with code 42710, this means
 	// the replication slot already exists.
 	ctx := context.Background()
-	//sql := fmt.Sprintf("DROP PUBLICATION IF EXISTS %s;", s.Publication)
-	//result := s.conn.Exec(context.Background(), sql)
-	//_, err = result.ReadAll()
-	//if err != nil {
-	//	return fmt.Errorf("drop publication if exists error", err)
-	//}
-	//
-	//var sql string
-	//if len(s.tables) == 0 {
-	//	sql = fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES;", s.Publication)
-	//} else {
-	//	sql = fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s;", s.Publication, strings.Join(s.tables, ","))
-	//}
-	//
-	//result := s.conn.Exec(context.Background(), sql)
-	//_, err = result.ReadAll()
-	//if err != nil {
-	//	if e, ok := err.(*pgconn.PgError); ok && e.Code == "42710" {
-	//		// publication exists
-	//	} else {
-	//		return err
-	//	}
-	//}
 
-	//sysident, err := pglogrepl.IdentifySystem(context.Background(), s.conn)
-	//if err != nil {
-	//	return fmt.Errorf("IdentifySystem failed:", err)
-	//}
-	//log.Println("SystemID:", sysident.SystemID, "Timeline:", sysident.Timeline, "XLogPos:", sysident.XLogPos, "DBName:", sysident.DBName)
-
-	_, err = pglogrepl.CreateReplicationSlot(ctx, s.conn, s.Name, "pgoutput", pglogrepl.CreateReplicationSlotOptions{Temporary: false})
+	_, err = pglogrepl.CreateReplicationSlot(
+		ctx,
+		s.conn,
+		s.SlotName,
+		"pgoutput",
+		pglogrepl.CreateReplicationSlotOptions{
+			Temporary: false,
+		},
+	)
 	if err != nil {
-		if e, ok := err.(*pgconn.PgError); ok && e.Code == "42710" {
+		if e, ok := err.(*pgconn.PgError); ok && e.Code == "42710" { // replication slot already exists
 			return ErrorSlotExist
 		}
 		return err
@@ -98,9 +117,10 @@ func (s *Subscription) CreateSlot() (err error) {
 	return nil
 }
 
+// DropSlot removes a replication slot if it exists.
 func (s *Subscription) DropSlot() (err error) {
 	ctx := context.Background()
-	err = pglogrepl.DropReplicationSlot(ctx, s.conn, s.Name, pglogrepl.DropReplicationSlotOptions{Wait: false})
+	err = pglogrepl.DropReplicationSlot(ctx, s.conn, s.SlotName, pglogrepl.DropReplicationSlotOptions{Wait: false})
 	if err != nil {
 		return err
 	}
@@ -132,29 +152,33 @@ func (s *Subscription) sendStatus(walWrite, walFlush uint64) error {
 	return nil
 }
 
-// Flush sends the status message to server indicating that we've fully applied all of the events until maxWal.
+// Flush sends the status message to server indicating that we've fully applied all of the events until s.maxWal.
 // This allows PostgreSQL to purge it's WAL logs
 func (s *Subscription) Flush() error {
 	wp := atomic.LoadUint64(&s.maxWal)
 	err := s.sendStatus(wp, wp)
 	if err == nil {
-		// atomic.StoreUint64(&s.walFlushed, wp)
+		atomic.StoreUint64(&s.walFlushed, wp)
 	}
 
-	//fmt.Printf("Flush => walWrite: %d, walFlush: %d\n", wp, wp)
 	return err
 }
 
 // Start replication and block until error or ctx is canceled
 func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int, recvWindow time.Duration, h Handler) error {
 	var err error
-	err = pglogrepl.StartReplication(ctx, s.conn, s.Name, pglogrepl.LSN(startLSN),
-		pglogrepl.StartReplicationOptions{
-			PluginArgs: []string{pluginArgs("1", s.Publication)},
-		})
 
+	err = pglogrepl.StartReplication(
+		ctx,
+		s.conn,
+		s.SlotName,
+		pglogrepl.LSN(startLSN),
+		pglogrepl.StartReplicationOptions{
+			PluginArgs: pluginArgs("1", s.PublicationName),
+		},
+	)
 	if err != nil {
-		return fmt.Errorf("failed to start replication: %s", err)
+		return fmt.Errorf("failed to start replication: %w", err)
 	}
 
 	s.maxWal = startLSN
@@ -175,13 +199,17 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 			walFlush = 0
 		}
 
-		// fmt.Printf("Send status => walWrite: %d (%s), walFlush: %d (%s)\n", walPos, pglogrepl.LSN(walPos), walFlush, pglogrepl.LSN(walFlush))
+		if s.logger != nil {
+			s.logger.Debugf("Send status => walWrite: %d (%s), walFlush: %d (%s)\n", walPos, pglogrepl.LSN(walPos), walFlush, pglogrepl.LSN(walFlush))
+		}
 
 		return s.sendStatus(walPos, walFlush)
 	}
 
-	heartbeat := make(chan bool)
+	heartbeat := make(chan bool, 1)
 	defer close(heartbeat)
+	sendStatusErr := make(chan error, 1)
+
 	go func() {
 		tick := time.NewTicker(s.StatusTimeout)
 		defer tick.Stop()
@@ -189,12 +217,16 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 		for {
 			select {
 			case <-tick.C:
-				sendStatus()
+				if err := sendStatus(); err != nil {
+					sendStatusErr <- err
+				}
 			case _, ok := <-heartbeat:
 				if !ok {
 					return
 				}
-				sendStatus()
+				if err := sendStatus(); err != nil {
+					sendStatusErr <- err
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -206,16 +238,19 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 		case <-ctx.Done():
 			// Send final status and exit
 			if err = sendStatus(); err != nil {
-				return fmt.Errorf("Unable to send final status: %s", err)
+				return fmt.Errorf("Unable to send final status: %w", err)
 			}
 
 			return err
-
+		case err = <-sendStatusErr:
+			return fmt.Errorf("Unable to send status from heartbeat: %w", err)
 		default:
 			n := 0
 			messages := make([][]byte, 0)
+
+			start := time.Now()
+
 			// batch recv messages up to batchSize
-			//start :=  time.Now()
 			for n < batchSize {
 				wctx, cancel := context.WithTimeout(ctx, recvWindow)
 				s.Lock()
@@ -227,57 +262,63 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 					if pgconn.Timeout(err) { // timeout, break loop
 						break
 					}
-					return fmt.Errorf("ReceiveMessage failed: %s", err)
+					return fmt.Errorf("ReceiveMessage failed: %w", err)
 				}
 
 				if msg == nil {
 					return fmt.Errorf("replication failed: nil message received, should not happen")
 				}
 
-				//log.Printf("%v, %#v", &msg, msg)
 				if msg, ok := msg.(*pgproto3.CopyData); ok {
+					if s.logger != nil {
+						s.logger.Debugf("received CopyData message: %s", &msg, string(msg.Data))
+					}
 					messages = append(messages, msg.Data)
 				}
 
 				n++
 			}
 
-			//fmt.Printf("recv %d messages in %d ms.\n", len(messages), time.Since(start).Milliseconds())
-
-			//log.Printf("%#v", messages)
-			// no message received, continue receiving
-			if len(messages) == 0 {
+			if len(messages) == 0 { // no message received, continue receiving
 				continue
 			}
 
+			if s.logger != nil {
+				s.logger.Debugf("recv %d messages in %d ms.\n", len(messages), time.Since(start).Milliseconds())
+			}
+
 			logmsgs := make([]Message, 0)
+
 			var walStart, serverWalEnd uint64
+
 			for _, msg := range messages {
 				switch msg[0] {
 				case pglogrepl.PrimaryKeepaliveMessageByteID:
 					pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg[1:])
 					if err != nil {
-						return fmt.Errorf("ParsePrimaryKeepaliveMessage failed: %s", err)
+						return fmt.Errorf("ParsePrimaryKeepaliveMessage failed: %w", err)
 					}
-					//fmt.Println("Primary Keepalive Message =>", "ServerWALEnd:", pkm.ServerWALEnd, "ServerTime:", pkm.ServerTime, "ReplyRequested:", pkm.ReplyRequested)
+					if s.logger != nil {
+						s.logger.Debugf("Primary Keepalive Message => ServerWALEnd: %d (%s) ReplyRequested: %t", pkm.ServerWALEnd, pkm.ServerWALEnd, pkm.ReplyRequested)
+					}
 
 					serverWalEnd = uint64(pkm.ServerWALEnd)
 
 					if pkm.ReplyRequested {
-						//if err = sendStatus(); err != nil {
-						//	return err
-						//}
 						heartbeat <- true
 					}
 
 				case pglogrepl.XLogDataByteID:
 					xld, err := pglogrepl.ParseXLogData(msg[1:])
 					if err != nil {
-						return fmt.Errorf("ParseXLogData failed: %s", err)
+						return fmt.Errorf("ParseXLogData failed: %w", err)
 					}
-					//fmt.Println("XLogData =>", "WALStart", xld.WALStart, "ServerWALEnd", xld.ServerWALEnd, "ServerTime:", xld.ServerTime, "WALData", string(xld.WALData))
+					if s.logger != nil {
+						s.logger.Debugf("XLogData => WALStart: %d (%s) ServerWALEnd: %d (%s) WALDataLen: %d", xld.WALStart, xld.WALStart, xld.ServerWALEnd, xld.ServerWALEnd, len(xld.WALData))
+					}
 
 					if walStart == 0 {
+						// walStart set only here
 						walStart = uint64(xld.WALStart)
 					}
 
@@ -286,37 +327,35 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 						continue
 					}
 
+					if walStart > atomic.LoadUint64(&s.maxWal) {
+						atomic.StoreUint64(&s.maxWal, walStart)
+					}
+
 					serverWalEnd = uint64(xld.ServerWALEnd)
-					//if walStart > atomic.LoadUint64(&s.maxWal) {
-					//	atomic.StoreUint64(&s.maxWal, walStart)
-					//}
 
 					logmsg, err := Parse(xld.WALData)
 					if err != nil {
-						return fmt.Errorf("invalid pgoutput message: %s", err)
+						return fmt.Errorf("invalid pgoutput message: %w", err)
 					}
+
 					logmsgs = append(logmsgs, logmsg)
 				}
 			}
 
-			// Ignore the error from handler for now
 			if len(logmsgs) > 0 {
 				if err = h(logmsgs, walStart); err != nil && s.failOnHandler {
 					return err
 				}
 
-				//if walStart > atomic.LoadUint64(&s.maxWal) {
-				//	atomic.StoreUint64(&s.maxWal, walStart)
-				//}
+				if walStart > atomic.LoadUint64(&s.maxWal) {
+					atomic.StoreUint64(&s.maxWal, walStart)
+					heartbeat <- true
+				}
 			}
 
 			if serverWalEnd > atomic.LoadUint64(&s.maxWal) {
 				atomic.StoreUint64(&s.maxWal, serverWalEnd)
-				// heartbeat <- true
-				// err = s.Flush() // notify server than all WAL messages are processed
-				// if err != nil {
-				// 	return err
-				// }
+				heartbeat <- true
 			}
 		}
 	}

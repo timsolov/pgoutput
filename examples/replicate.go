@@ -13,6 +13,14 @@ import (
 	"github.com/timsolov/pgoutput"
 )
 
+type L struct {
+	pgoutput.Logger
+}
+
+func (l *L) Debugf(format string, args ...interface{}) {
+	log.Printf(format, args...)
+}
+
 func main() {
 	// PGOUTPUT_DEMO_CONN_STRING=postgres://dbuser:@127.0.0.1/dbname?replication=database
 	conn, err := pgconn.Connect(context.Background(), os.Getenv("PGOUTPUT_DEMO_CONN_STRING"))
@@ -40,7 +48,7 @@ func main() {
 	}
 
 	nMsg := 0
-	handler := func(messages []pgoutput.Message, walPos uint64) error {
+	handler := func(messages []pgoutput.Message, walStart uint64) error {
 		for _, m := range messages {
 			switch v := m.(type) {
 			case pgoutput.Relation:
@@ -67,7 +75,8 @@ func main() {
 		return nil
 	}
 
-	sub := pgoutput.NewSubscription(conn, "usrevtsub", "usrevtpub", 0, false)
+	sub := pgoutput.NewSubscription(conn, "db2", "outbox_insert",
+		pgoutput.SetLogger(&L{}))
 	err = sub.CreateSlot()
 	if err != nil {
 		if err == pgoutput.ErrorSlotExist {
@@ -92,7 +101,7 @@ func main() {
 	}()
 
 	signal.Notify(osSignal, syscall.SIGINT, syscall.SIGTERM)
-	if err = sub.Start(ctx, 0, 100, time.Millisecond*100, handler); err != nil {
+	if err = sub.Start(ctx, 0, 100, time.Second*1, handler); err != nil {
 		log.Fatal(err)
 	}
 }
