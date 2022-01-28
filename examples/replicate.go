@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgconn"
+	"github.com/jackc/pglogrepl"
 	"github.com/timsolov/pgoutput"
 )
 
@@ -37,7 +38,7 @@ func main() {
 		}
 		r, ok := set.Get(relation)
 		if ok {
-			log.Printf("Ralation : %s", r.Name)
+			log.Printf("Relation : %s", r.Name)
 		}
 
 		for name, value := range values {
@@ -48,34 +49,8 @@ func main() {
 	}
 
 	nMsg := 0
-	handler := func(messages []pgoutput.Message, walStart uint64) error {
-		for _, m := range messages {
-			switch v := m.(type) {
-			case pgoutput.Relation:
-				log.Printf("RELATION")
-				set.Add(v)
-			case pgoutput.Insert:
-				log.Printf("INSERT")
-				dump(v.RelationID, v.Row)
-			case pgoutput.Update:
-				log.Printf("UPDATE")
-				dump(v.RelationID, v.Row)
-			case pgoutput.Delete:
-				log.Printf("DELETE")
-				dump(v.RelationID, v.Row)
-			case pgoutput.Begin:
-				log.Printf("BEGIN")
-			case pgoutput.Commit:
-				log.Printf("COMMIT")
-			}
-			nMsg++
-			//log.Println(nMsg)
-		}
 
-		return nil
-	}
-
-	sub := pgoutput.NewSubscription(conn, "db2", "outbox_insert",
+	sub := pgoutput.NewSubscription(conn, "db3", "outbox_insert",
 		pgoutput.SetLogger(&L{}))
 	err = sub.CreateSlot()
 	if err != nil {
@@ -85,6 +60,34 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+
+	handler := func(messages []pgoutput.Message) error {
+		for _, m := range messages {
+			log.Println(m.WalStart(), pglogrepl.LSN(m.WalStart()), m.WalEnd(), pglogrepl.LSN(m.WalEnd()))
+			switch v := m.(type) {
+			case *pgoutput.Relation:
+				log.Printf("RELATION")
+				set.Add(*v)
+			case *pgoutput.Insert:
+				log.Printf("INSERT")
+				dump(v.RelationID, v.Row)
+			case *pgoutput.Update:
+				log.Printf("UPDATE")
+				dump(v.RelationID, v.Row)
+			case *pgoutput.Delete:
+				log.Printf("DELETE")
+				dump(v.RelationID, v.Row)
+			case *pgoutput.Begin:
+				log.Printf("BEGIN")
+			case *pgoutput.Commit:
+				log.Printf("COMMIT")
+			}
+			nMsg++
+		}
+
+		return nil
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// Initialize signal handler
@@ -101,7 +104,7 @@ func main() {
 	}()
 
 	signal.Notify(osSignal, syscall.SIGINT, syscall.SIGTERM)
-	if err = sub.Start(ctx, 0, 100, time.Second*1, handler); err != nil {
+	if err = sub.Start(ctx, 0, time.Second*1, handler); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -71,9 +71,9 @@ func TestParseWalData(t *testing.T) {
 		}
 
 		switch v := m.(type) {
-		case Relation:
-			set.Add(v)
-		case Insert:
+		case *Relation:
+			set.Add(*v)
+		case *Insert:
 			t.Run(fmt.Sprintf("waldata/%d", i), func(t *testing.T) {
 				values, err := set.Values(v.RelationID, v.Row)
 				if err != nil {
@@ -88,7 +88,7 @@ func TestParseWalData(t *testing.T) {
 					t.Errorf("val: %s", diff)
 				}
 			})
-		case Type:
+		case *Type:
 			if v.ID != 35756 {
 				t.Errorf("Type OID: %d", v.ID)
 			}

@@ -35,7 +35,7 @@ type Subscription struct {
 	sync.Mutex
 }
 
-type Handler func([]Message, uint64) error
+type Handler func(messages []Message) error
 
 type SubOpt func(*Subscription)
 
@@ -53,7 +53,7 @@ func SetWALRetain(retainBytes uint64) SubOpt {
 	}
 }
 
-// Whether to exit from Start() func on failure in users handler
+// whether to exit from Start() func on failure in users handler
 func SetFailOnHandler(b bool) SubOpt {
 	return func(s *Subscription) {
 		s.failOnHandler = b
@@ -128,9 +128,22 @@ func (s *Subscription) DropSlot() (err error) {
 	return nil
 }
 
-func (s *Subscription) sendStatus(walWrite, walFlush uint64) error {
-	if walFlush > walWrite {
+func (s *Subscription) sendStatus(offsetProcessed uint64) error {
+	if offsetProcessed > atomic.LoadUint64(&s.maxWal) {
 		return fmt.Errorf("walWrite should be >= walFlush")
+	}
+
+	// Confirm only walRetain bytes in past
+	// If s.walRetain is zero - will confirm current walPos as flushed
+	walFlushed := offsetProcessed - s.walRetain
+
+	if walFlushed < 0 {
+		// If we have less than walRetain bytes - just report zero
+		walFlushed = 0
+	}
+
+	if s.logger != nil {
+		s.logger.Debugf("Send status (real) => walFlushed: %d (%s)\n", walFlushed, pglogrepl.LSN(walFlushed))
 	}
 
 	s.Lock()
@@ -138,41 +151,74 @@ func (s *Subscription) sendStatus(walWrite, walFlush uint64) error {
 
 	err := pglogrepl.SendStandbyStatusUpdate(context.Background(), s.conn,
 		pglogrepl.StandbyStatusUpdate{
-			WALWritePosition: pglogrepl.LSN(walWrite),
-			WALFlushPosition: pglogrepl.LSN(walFlush),
-			WALApplyPosition: pglogrepl.LSN(walFlush),
+			WALWritePosition: pglogrepl.LSN(walFlushed),
+			WALFlushPosition: pglogrepl.LSN(walFlushed),
+			WALApplyPosition: pglogrepl.LSN(walFlushed),
 		})
 
 	if err != nil {
 		return err
 	}
 
-	atomic.StoreUint64(&s.walFlushed, walFlush)
+	atomic.StoreUint64(&s.walFlushed, offsetProcessed)
 
 	return nil
 }
 
-// Flush sends the status message to server indicating that we've fully applied all of the events until s.maxWal.
-// This allows PostgreSQL to purge it's WAL logs
-func (s *Subscription) Flush() error {
-	wp := atomic.LoadUint64(&s.maxWal)
-	err := s.sendStatus(wp, wp)
-	if err == nil {
-		atomic.StoreUint64(&s.walFlushed, wp)
+// FlushWalPosition sends to postgresql info about offset position already processed.
+func (s *Subscription) FlushWalPosition(offset uint64) error {
+	if offset > atomic.LoadUint64(&s.maxWal) {
+		return fmt.Errorf("offset more then read position")
+	}
+	if offset < atomic.LoadUint64(&s.walFlushed) {
+		return fmt.Errorf("offset before flushed position")
 	}
 
-	return err
+	atomic.StoreUint64(&s.walFlushed, offset)
+
+	return s.sendStatus(offset)
+}
+
+// SlotRestartLSN returns the value of the last possible to restart offset for a specific slot.
+func (s *Subscription) SlotRestartLSN(ctx context.Context, slotName string) (pglogrepl.LSN, error) {
+	sql := fmt.Sprintf("SELECT restart_lsn FROM pg_replication_slots WHERE slot_name='%s'", slotName)
+	mrr := s.conn.Exec(ctx, sql)
+
+	results, err := mrr.ReadAll()
+	if err != nil {
+		return 0, err
+	}
+	if len(results) != 1 {
+		return 0, fmt.Errorf("expected 1 result set, got %d", len(results))
+	}
+
+	result := results[0]
+	if len(result.Rows) != 1 {
+		return 0, fmt.Errorf("expected 1 result row, got %d", len(result.Rows))
+	}
+
+	row := result.Rows[0]
+	if len(row) != 1 {
+		return 0, fmt.Errorf("expected 1 result columns, got %d", len(row))
+	}
+
+	colData := string(row[0])
+
+	return pglogrepl.ParseLSN(colData)
 }
 
 // Start replication and block until error or ctx is canceled
-func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int, recvWindow time.Duration, h Handler) error {
+//   startOffset - LSN position where logical replication should start from (to take the offset from LSN possible using pglogrepl.ParseLSN);
+//   recvWindow  - timeout to waiting messages from PostgreSQL;
+//   h           - callback handler to process RELATION, INSERT, UPDATE, DELETE messages.
+func (s *Subscription) Start(ctx context.Context, startOffset uint64, recvWindow time.Duration, h Handler) error {
 	var err error
 
 	err = pglogrepl.StartReplication(
 		ctx,
 		s.conn,
 		s.SlotName,
-		pglogrepl.LSN(startLSN),
+		pglogrepl.LSN(startOffset),
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: pluginArgs("1", s.PublicationName),
 		},
@@ -181,29 +227,16 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 		return fmt.Errorf("failed to start replication: %w", err)
 	}
 
-	s.maxWal = startLSN
+	s.maxWal = startOffset
 
 	sendStatus := func() error {
-		walPos := atomic.LoadUint64(&s.maxWal)
-		walLastFlushed := atomic.LoadUint64(&s.walFlushed)
-
-		// Confirm only walRetain bytes in past
-		// If walRetain is zero - will confirm current walPos as flushed
-		walFlush := walPos - s.walRetain
-
-		if walLastFlushed > walFlush {
-			// If there was a manual flush - report it's position until we're past it
-			walFlush = walLastFlushed
-		} else if walFlush < 0 {
-			// If we have less than walRetain bytes - just report zero
-			walFlush = 0
-		}
+		walFlushed := atomic.LoadUint64(&s.walFlushed)
 
 		if s.logger != nil {
-			s.logger.Debugf("Send status => walWrite: %d (%s), walFlush: %d (%s)\n", walPos, pglogrepl.LSN(walPos), walFlush, pglogrepl.LSN(walFlush))
+			s.logger.Debugf("Send status (virtual) => walFlushed: %d (%s)\n", walFlushed, pglogrepl.LSN(walFlushed))
 		}
 
-		return s.sendStatus(walPos, walFlush)
+		return s.sendStatus(walFlushed)
 	}
 
 	heartbeat := make(chan bool, 1)
@@ -233,6 +266,8 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 		}
 	}()
 
+	logmsgs := make([]Message, 0)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -245,16 +280,10 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 		case err = <-sendStatusErr:
 			return fmt.Errorf("Unable to send status from heartbeat: %w", err)
 		default:
-			n := 0
-			messages := make([][]byte, 0)
-
-			start := time.Now()
-
-			// batch recv messages up to batchSize
-			for n < batchSize {
+			{
 				wctx, cancel := context.WithTimeout(ctx, recvWindow)
 				s.Lock()
-				msg, err := s.conn.ReceiveMessage(wctx)
+				message, err := s.conn.ReceiveMessage(wctx)
 				s.Unlock()
 				cancel()
 
@@ -265,33 +294,17 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 					return fmt.Errorf("ReceiveMessage failed: %w", err)
 				}
 
-				if msg == nil {
+				if message == nil {
 					return fmt.Errorf("replication failed: nil message received, should not happen")
 				}
 
-				if msg, ok := msg.(*pgproto3.CopyData); ok {
-					if s.logger != nil {
-						s.logger.Debugf("received CopyData message: %s", &msg, string(msg.Data))
-					}
-					messages = append(messages, msg.Data)
+				copyData, isCopyData := message.(*pgproto3.CopyData)
+				if !isCopyData {
+					continue
 				}
 
-				n++
-			}
+				msg := copyData.Data
 
-			if len(messages) == 0 { // no message received, continue receiving
-				continue
-			}
-
-			if s.logger != nil {
-				s.logger.Debugf("recv %d messages in %d ms.\n", len(messages), time.Since(start).Milliseconds())
-			}
-
-			logmsgs := make([]Message, 0)
-
-			var walStart, serverWalEnd uint64
-
-			for _, msg := range messages {
 				switch msg[0] {
 				case pglogrepl.PrimaryKeepaliveMessageByteID:
 					pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg[1:])
@@ -302,7 +315,10 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 						s.logger.Debugf("Primary Keepalive Message => ServerWALEnd: %d (%s) ReplyRequested: %t", pkm.ServerWALEnd, pkm.ServerWALEnd, pkm.ReplyRequested)
 					}
 
-					serverWalEnd = uint64(pkm.ServerWALEnd)
+					serverWalEnd := uint64(pkm.ServerWALEnd)
+					if serverWalEnd > atomic.LoadUint64(&s.maxWal) {
+						atomic.StoreUint64(&s.maxWal, serverWalEnd)
+					}
 
 					if pkm.ReplyRequested {
 						heartbeat <- true
@@ -313,50 +329,62 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, batchSize int
 					if err != nil {
 						return fmt.Errorf("ParseXLogData failed: %w", err)
 					}
-					if s.logger != nil {
-						s.logger.Debugf("XLogData => WALStart: %d (%s) ServerWALEnd: %d (%s) WALDataLen: %d", xld.WALStart, xld.WALStart, xld.ServerWALEnd, xld.ServerWALEnd, len(xld.WALData))
-					}
 
-					if walStart == 0 {
-						// walStart set only here
-						walStart = uint64(xld.WALStart)
+					walStart := uint64(xld.WALStart)
+					serverWalEnd := uint64(xld.ServerWALEnd)
+					if serverWalEnd > atomic.LoadUint64(&s.maxWal) {
+						atomic.StoreUint64(&s.maxWal, serverWalEnd)
 					}
 
 					// Skip stuff that's in the past
-					if walStart > 0 && walStart <= startLSN {
+					if walStart > 0 && walStart <= startOffset {
 						continue
 					}
 
-					if walStart > atomic.LoadUint64(&s.maxWal) {
-						atomic.StoreUint64(&s.maxWal, walStart)
-					}
+					var logmsg Message
 
-					serverWalEnd = uint64(xld.ServerWALEnd)
-
-					logmsg, err := Parse(xld.WALData)
+					logmsg, err = Parse(xld.WALData)
 					if err != nil {
 						return fmt.Errorf("invalid pgoutput message: %w", err)
 					}
+					logmsg.SetWalStart(walStart)
 
-					logmsgs = append(logmsgs, logmsg)
+					if len(logmsgs) > 0 {
+						logmsgs[len(logmsgs)-1].SetWalEnd(walStart)
+					}
+
+					switch logmsg.(type) {
+					case *Relation, *Insert, *Update, *Delete:
+						logmsgs = append(logmsgs, logmsg)
+					case *Begin:
+						logmsgs = nil
+					case *Commit:
+						if len(logmsgs) > 0 {
+							if err = h(logmsgs); err != nil && s.failOnHandler {
+								return err
+							}
+						}
+					}
 				}
-			}
-
-			if len(logmsgs) > 0 {
-				if err = h(logmsgs, walStart); err != nil && s.failOnHandler {
-					return err
-				}
-
-				if walStart > atomic.LoadUint64(&s.maxWal) {
-					atomic.StoreUint64(&s.maxWal, walStart)
-					heartbeat <- true
-				}
-			}
-
-			if serverWalEnd > atomic.LoadUint64(&s.maxWal) {
-				atomic.StoreUint64(&s.maxWal, serverWalEnd)
-				heartbeat <- true
 			}
 		}
 	}
+}
+
+func msgType(logmsg Message) string {
+	switch logmsg.(type) {
+	case *Relation:
+		return "RELATION"
+	case *Insert:
+		return "INSERT"
+	case *Update:
+		return "UPDATE"
+	case *Delete:
+		return "DELETE"
+	case *Begin:
+		return "BEGIN"
+	case *Commit:
+		return "COMMIT"
+	}
+	return "Unk"
 }

@@ -108,6 +108,10 @@ type Begin struct {
 	Timestamp time.Time
 	// 	Xid of the transaction.
 	XID int32
+	// position where this message starts in WAL
+	walStart uint64
+	// position where this message ends in WAL
+	walEnd uint64
 }
 
 type Commit struct {
@@ -117,6 +121,10 @@ type Commit struct {
 	// The final LSN of the transaction.
 	TransactionLSN uint64
 	Timestamp      time.Time
+	// position where this message starts in WAL
+	walStart uint64
+	// position where this message ends in WAL
+	walEnd uint64
 }
 
 type Relation struct {
@@ -127,6 +135,10 @@ type Relation struct {
 	Name      string
 	Replica   uint8
 	Columns   []Column
+	// position where this message starts in WAL
+	walStart uint64
+	// position where this message ends in WAL
+	walEnd uint64
 }
 
 func (r Relation) IsEmpty() bool {
@@ -138,6 +150,10 @@ type Type struct {
 	ID        uint32
 	Namespace string
 	Name      string
+	// position where this message starts in WAL
+	walStart uint64
+	// position where this message ends in WAL
+	walEnd uint64
 }
 
 type Insert struct {
@@ -146,6 +162,10 @@ type Insert struct {
 	// Identifies the following TupleData message as a new tuple.
 	New bool
 	Row []Tuple
+	// position where this message starts in WAL
+	walStart uint64
+	// position where this message ends in WAL
+	walEnd uint64
 }
 
 type Update struct {
@@ -157,6 +177,10 @@ type Update struct {
 	New    bool
 	OldRow []Tuple
 	Row    []Tuple
+	// position where this message starts in WAL
+	walStart uint64
+	// position where this message ends in WAL
+	walEnd uint64
 }
 
 type Delete struct {
@@ -166,14 +190,26 @@ type Delete struct {
 	Key bool // TODO
 	Old bool // TODO
 	Row []Tuple
+	// position where this message starts in WAL
+	walStart uint64
+	// position where this message ends in WAL
+	walEnd uint64
 }
 
 type Truncate struct {
+	// position where this message starts in WAL
+	walStart uint64
+	// position where this message ends in WAL
+	walEnd uint64
 }
 
 type Origin struct {
 	LSN  uint64
 	Name string
+	// position where this message starts in WAL
+	walStart uint64
+	// position where this message ends in WAL
+	walEnd uint64
 }
 
 type DecoderValue interface {
@@ -193,18 +229,51 @@ type Tuple struct {
 }
 
 type Message interface {
-	msg()
+	SetWalStart(offset uint64)
+	WalStart() uint64
+	SetWalEnd(offset uint64)
+	WalEnd() uint64
 }
 
-func (Begin) msg()    {}
-func (Relation) msg() {}
-func (Update) msg()   {}
-func (Insert) msg()   {}
-func (Delete) msg()   {}
-func (Commit) msg()   {}
-func (Origin) msg()   {}
-func (Type) msg()     {}
-func (Truncate) msg() {}
+func (m *Begin) SetWalStart(offset uint64)    { m.walStart = offset }
+func (m *Relation) SetWalStart(offset uint64) { m.walStart = offset }
+func (m *Update) SetWalStart(offset uint64)   { m.walStart = offset }
+func (m *Insert) SetWalStart(offset uint64)   { m.walStart = offset }
+func (m *Delete) SetWalStart(offset uint64)   { m.walStart = offset }
+func (m *Commit) SetWalStart(offset uint64)   { m.walStart = offset }
+func (m *Origin) SetWalStart(offset uint64)   { m.walStart = offset }
+func (m *Type) SetWalStart(offset uint64)     { m.walStart = offset }
+func (m *Truncate) SetWalStart(offset uint64) { m.walStart = offset }
+
+func (m Begin) WalStart() uint64    { return m.walStart }
+func (m Relation) WalStart() uint64 { return m.walStart }
+func (m Update) WalStart() uint64   { return m.walStart }
+func (m Insert) WalStart() uint64   { return m.walStart }
+func (m Delete) WalStart() uint64   { return m.walStart }
+func (m Commit) WalStart() uint64   { return m.walStart }
+func (m Origin) WalStart() uint64   { return m.walStart }
+func (m Type) WalStart() uint64     { return m.walStart }
+func (m Truncate) WalStart() uint64 { return m.walStart }
+
+func (m *Begin) SetWalEnd(offset uint64)    { m.walEnd = offset }
+func (m *Relation) SetWalEnd(offset uint64) { m.walEnd = offset }
+func (m *Update) SetWalEnd(offset uint64)   { m.walEnd = offset }
+func (m *Insert) SetWalEnd(offset uint64)   { m.walEnd = offset }
+func (m *Delete) SetWalEnd(offset uint64)   { m.walEnd = offset }
+func (m *Commit) SetWalEnd(offset uint64)   { m.walEnd = offset }
+func (m *Origin) SetWalEnd(offset uint64)   { m.walEnd = offset }
+func (m *Type) SetWalEnd(offset uint64)     { m.walEnd = offset }
+func (m *Truncate) SetWalEnd(offset uint64) { m.walEnd = offset }
+
+func (m Begin) WalEnd() uint64    { return m.walEnd }
+func (m Relation) WalEnd() uint64 { return m.walEnd }
+func (m Update) WalEnd() uint64   { return m.walEnd }
+func (m Insert) WalEnd() uint64   { return m.walEnd }
+func (m Delete) WalEnd() uint64   { return m.walEnd }
+func (m Commit) WalEnd() uint64   { return m.walEnd }
+func (m Origin) WalEnd() uint64   { return m.walEnd }
+func (m Type) WalEnd() uint64     { return m.walEnd }
+func (m Truncate) WalEnd() uint64 { return m.walEnd }
 
 // Parse a logical replication message.
 // See https://www.postgresql.org/docs/current/static/protocol-logicalrep-message-formats.html
@@ -213,25 +282,25 @@ func Parse(src []byte) (Message, error) {
 	d := &decoder{order: binary.BigEndian, buf: bytes.NewBuffer(src[1:])}
 	switch msgType {
 	case 'B':
-		b := Begin{}
+		b := &Begin{}
 		b.LSN = d.uint64()
 		b.Timestamp = d.timestamp()
 		b.XID = d.int32()
 		return b, nil
 	case 'C':
-		c := Commit{}
+		c := &Commit{}
 		c.Flags = d.uint8()
 		c.LSN = d.uint64()
 		c.TransactionLSN = d.uint64()
 		c.Timestamp = d.timestamp()
 		return c, nil
 	case 'O':
-		o := Origin{}
+		o := &Origin{}
 		o.LSN = d.uint64()
 		o.Name = d.string()
 		return o, nil
 	case 'R':
-		r := Relation{}
+		r := &Relation{}
 		r.ID = d.uint32()
 		r.Namespace = d.string()
 		r.Name = d.string()
@@ -239,19 +308,19 @@ func Parse(src []byte) (Message, error) {
 		r.Columns = d.columns()
 		return r, nil
 	case 'Y':
-		t := Type{}
+		t := &Type{}
 		t.ID = d.uint32()
 		t.Namespace = d.string()
 		t.Name = d.string()
 		return t, nil
 	case 'I':
-		i := Insert{}
+		i := &Insert{}
 		i.RelationID = d.uint32()
 		i.New = d.uint8() > 0
 		i.Row = d.tupledata()
 		return i, nil
 	case 'U':
-		u := Update{}
+		u := &Update{}
 		u.RelationID = d.uint32()
 		u.Key = d.rowinfo('K')
 		u.Old = d.rowinfo('O')
@@ -262,14 +331,14 @@ func Parse(src []byte) (Message, error) {
 		u.Row = d.tupledata()
 		return u, nil
 	case 'D':
-		dl := Delete{}
+		dl := &Delete{}
 		dl.RelationID = d.uint32()
 		dl.Key = d.rowinfo('K')
 		dl.Old = d.rowinfo('O')
 		dl.Row = d.tupledata()
 		return dl, nil
 	case 'T':
-		tr := Truncate{}
+		tr := &Truncate{}
 		return tr, nil
 	default:
 		return nil, fmt.Errorf("Unknown message type for %s (%d)", []byte{msgType}, msgType)
